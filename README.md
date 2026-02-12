@@ -41,6 +41,7 @@ npx -y codex-claudecode-proxy@latest status
 npx -y codex-claudecode-proxy@latest start
 npx -y codex-claudecode-proxy@latest stop
 npx -y codex-claudecode-proxy@latest uninstall
+npx -y codex-claudecode-proxy@latest purge --yes
 ```
 
 ## Requirements

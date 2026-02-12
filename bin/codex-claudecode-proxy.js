@@ -35,12 +35,14 @@ Commands:
   start        Start proxy LaunchAgent
   stop         Stop proxy + sync LaunchAgents
   status       Show status
-  uninstall    Remove LaunchAgents + zshrc block (does not delete binaries by default)
+  uninstall    Remove LaunchAgents + zshrc block (keeps proxy files)
+  purge        Uninstall + remove proxy files + clean Claude Code settings
   help         Show this help
 
 Examples:
   npx -y codex-claudecode-proxy@latest --yes
   npx -y codex-claudecode-proxy@latest status
+  npx -y codex-claudecode-proxy@latest purge --yes
 `;
   console.log(txt);
   process.exit(code);
@@ -498,6 +500,35 @@ function updateClaudeSettings({ claudeSettingsPath, port, model }) {
   writeFileAtomic(claudeSettingsPath, `${JSON.stringify(json, null, 2)}\n`, 0o600);
 }
 
+function cleanupClaudeSettings({ claudeSettingsPath, model }) {
+  if (!exists(claudeSettingsPath)) return;
+
+  backupFile(claudeSettingsPath);
+
+  let json;
+  try {
+    json = JSON.parse(readText(claudeSettingsPath));
+  } catch {
+    fail(`failed to parse JSON: ${claudeSettingsPath}`);
+  }
+
+  if (!json || typeof json !== "object") return;
+
+  if (json.model === model) delete json.model;
+
+  if (json.env && typeof json.env === "object") {
+    delete json.env.ANTHROPIC_BASE_URL;
+    delete json.env.ANTHROPIC_AUTH_TOKEN;
+    delete json.env.ANTHROPIC_MODEL;
+    delete json.env.ANTHROPIC_SMALL_FAST_MODEL;
+    delete json.env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+    delete json.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+    delete json.env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+  }
+
+  writeFileAtomic(claudeSettingsPath, `${JSON.stringify(json, null, 2)}\n`, 0o600);
+}
+
 function updateZshrc({ zshrcPath, port }) {
   ensureDir(path.dirname(zshrcPath));
   const mode = exists(zshrcPath) ? (fs.statSync(zshrcPath).mode & 0o777) : 0o600;
@@ -710,9 +741,15 @@ async function uninstallFlow(opts) {
   const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${labelProxy}.plist`);
   const plistSync = path.join(homeDir, "Library", "LaunchAgents", `${labelSync}.plist`);
   const zshrcPath = path.join(homeDir, ".zshrc");
+  const claudeSettingsPath = path.join(homeDir, ".claude", "settings.json");
+  const proxyDir = path.join(homeDir, ".cli-proxy-api");
+  const proxyBin = path.join(homeDir, ".local", "bin", "cli-proxy-api");
 
   if (!opts.yes) {
-    const ok = promptYesNo("Remove LaunchAgents + ~/.zshrc block? (y/N) ");
+    const q = opts.command === "purge"
+      ? "Purge: remove LaunchAgents + ~/.zshrc block + proxy files + clean ~/.claude/settings.json? (y/N) "
+      : "Remove LaunchAgents + ~/.zshrc block? (y/N) ";
+    const ok = promptYesNo(q);
     if (!ok) fail("cancelled", 2);
   }
 
@@ -722,14 +759,26 @@ async function uninstallFlow(opts) {
   if (exists(plistProxy)) fs.rmSync(plistProxy, { force: true });
   if (exists(plistSync)) fs.rmSync(plistSync, { force: true });
 
-  if (exists(zshrcPath)) {
+  if (!opts.noZshrc && exists(zshrcPath)) {
     const mode = fs.statSync(zshrcPath).mode & 0o777;
     backupFile(zshrcPath);
     const next = removeZshrcBlock(readText(zshrcPath));
     writeFileAtomic(zshrcPath, `${next.trimEnd()}\n`, mode);
   }
 
-  log("uninstall completed (binaries/config left in place)");
+  if (opts.command === "purge") {
+    if (!opts.noClaudeSettings) {
+      cleanupClaudeSettings({ claudeSettingsPath, model: opts.model });
+    }
+
+    // Remove proxy installation files (best-effort).
+    if (exists(proxyDir)) fs.rmSync(proxyDir, { recursive: true, force: true });
+    if (exists(proxyBin)) fs.rmSync(proxyBin, { force: true });
+    log("purge completed (proxy files removed)");
+    return;
+  }
+
+  log("uninstall completed (proxy files left in place)");
 }
 
 async function main() {
@@ -751,6 +800,9 @@ async function main() {
         await statusFlow(opts);
         break;
       case "uninstall":
+        await uninstallFlow(opts);
+        break;
+      case "purge":
         await uninstallFlow(opts);
         break;
       default:
