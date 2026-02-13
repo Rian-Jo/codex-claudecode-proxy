@@ -27,10 +27,10 @@ npx -y codex-claudecode-proxy@latest status
 npx -y codex-claudecode-proxy@latest start
 npx -y codex-claudecode-proxy@latest stop
 
-# 백그라운드 실행을 끄고 Claude Code 설정을 원래대로 되돌림
+# 백그라운드 실행을 끄고 Claude Code 설정을 제거함
 npx -y codex-claudecode-proxy@latest uninstall
 
-# 제거 + 설치된 파일까지 모두 삭제
+# Claude Code 설정 & 설치된 파일까지 모두 삭제
 npx -y codex-claudecode-proxy@latest purge
 ```
 ## 무결성/안전
