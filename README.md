@@ -1,43 +1,44 @@
 # codex-claudecode-proxy
 
-openai oauth api 를 claude 호환 api 로 번역해주는 로컬 프록시 설치도우미 cli
+A local proxy installer CLI that translates the OpenAI OAuth API into a Claude-compatible API.
 
-## 그저 한줄.
+## One-Liner
 
 ```bash
 npx -y codex-claudecode-proxy
 ```
 
-## 요구사항
+## Requirements
 
-- macOS 전용 (아직은)
-- Claude Code 가 설치되어 있어야 함
-- Codex Cli 에 로그인되어 있어야 함
+- macOS only (for now)
+- Claude Code is installed
+- You are logged in to Codex CLI
 
-## 명령어목록
+## Commands
 
 ```bash
-# 설치(재실행해도 안전하게 동작)
-npx -y codex-claudecode-proxy@latest
+# Install (safe to re-run)
+npx -y codex-claudecode-proxy
 
-# 상태 확인
-npx -y codex-claudecode-proxy@latest status
+# Status
+npx -y codex-claudecode-proxy status
 
-# 수동 시작/중지
-npx -y codex-claudecode-proxy@latest start
-npx -y codex-claudecode-proxy@latest stop
+# Start/stop manually
+npx -y codex-claudecode-proxy start
+npx -y codex-claudecode-proxy stop
 
-# 백그라운드 실행을 끄고 Claude Code 설정을 제거함
-npx -y codex-claudecode-proxy@latest uninstall
+# Uninstall: stop background services and restore Claude Code settings
+npx -y codex-claudecode-proxy uninstall
 
-# Claude Code 설정 & 설치된 파일까지 모두 삭제
-npx -y codex-claudecode-proxy@latest purge
+# Purge: uninstall + remove installed files
+npx -y codex-claudecode-proxy purge
 ```
-## 무결성/안전
 
-- Claude Code 설정은 자동으로 구성되며, 변경 전 백업을 남깁니다.
-- `uninstall`을 실행하면 “프록시를 쓰도록 바꿔둔 Claude Code 설정”을 정리해 원복합니다.
+## Integrity / Safety
 
-## 라이선스
+- Claude Code settings are configured automatically, and a backup is created before changes.
+- Running `uninstall` removes the proxy-related Claude settings and restores the original behavior.
+
+## License
 
 MIT
