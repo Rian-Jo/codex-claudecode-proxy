@@ -33,10 +33,10 @@ function usage(code = 0) {
 
 Commands:
   install      Install + configure + start (default)
-  start        Start proxy LaunchAgent
-  stop         Stop proxy + sync LaunchAgents
+  start        Start proxy background services
+  stop         Stop proxy background services
   status       Show status
-  uninstall    Remove LaunchAgents + restore Claude Code settings (keeps proxy files)
+  uninstall    Remove background services + restore Claude Code settings (keeps proxy files)
   purge        Uninstall + remove proxy files
   help         Show this help
 
@@ -47,6 +47,14 @@ Examples:
 `;
   console.log(txt);
   process.exit(code);
+}
+
+function currentPlatform() {
+  return process.env.CODEX_PROXY_PLATFORM || process.platform;
+}
+
+function shouldSkipHealthcheck() {
+  return process.env.CODEX_PROXY_SKIP_HEALTHCHECK === "1";
 }
 
 function parseArgs(argv) {
@@ -293,46 +301,47 @@ payload:
 }
 
 function tokenSyncScript() {
-  return `#!/usr/bin/env bash
-set -euo pipefail
+  return `#!/usr/bin/env node
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-SRC="\${1:-$HOME/.codex/auth.json}"
-DST="\${2:-$HOME/.cli-proxy-api/auths/codex-from-codex-cli.json}"
+const src = process.argv[2] || path.join(os.homedir(), ".codex", "auth.json");
+const dst = process.argv[3] || path.join(os.homedir(), ".cli-proxy-api", "auths", "codex-from-codex-cli.json");
 
-if [[ ! -f "\${SRC}" ]]; then
-  echo "missing \${SRC} (Codex CLI login required)" >&2
-  exit 1
-fi
-
-access_token="$(plutil -extract tokens.access_token raw -o - "\${SRC}" 2>/dev/null || true)"
-if [[ -z "\${access_token}" ]]; then
-  echo "tokens.access_token missing in \${SRC}" >&2
-  exit 1
-fi
-
-id_token="$(plutil -extract tokens.id_token raw -o - "\${SRC}" 2>/dev/null || true)"
-refresh_token="$(plutil -extract tokens.refresh_token raw -o - "\${SRC}" 2>/dev/null || true)"
-account_id="$(plutil -extract tokens.account_id raw -o - "\${SRC}" 2>/dev/null || true)"
-last_refresh="$(plutil -extract last_refresh raw -o - "\${SRC}" 2>/dev/null || true)"
-
-mkdir -p "$(dirname "\${DST}")"
-
-cat > "\${DST}.tmp" <<JSON
-{
-  "access_token": "\${access_token}",
-  "account_id": "\${account_id}",
-  "disabled": false,
-  "email": "",
-  "expired": "",
-  "id_token": "\${id_token}",
-  "last_refresh": "\${last_refresh}",
-  "refresh_token": "\${refresh_token}",
-  "type": "codex"
+if (!fs.existsSync(src)) {
+  console.error("missing " + src + " (Codex CLI login required)");
+  process.exit(1);
 }
-JSON
 
-mv "\${DST}.tmp" "\${DST}"
-chmod 600 "\${DST}"
+const auth = JSON.parse(fs.readFileSync(src, "utf8"));
+const accessToken = auth?.tokens?.access_token || "";
+if (!accessToken) {
+  console.error("tokens.access_token missing in " + src);
+  process.exit(1);
+}
+
+const out = {
+  access_token: accessToken,
+  account_id: auth?.tokens?.account_id || "",
+  disabled: false,
+  email: "",
+  expired: "",
+  id_token: auth?.tokens?.id_token || "",
+  last_refresh: String(auth?.last_refresh || ""),
+  refresh_token: auth?.tokens?.refresh_token || "",
+  type: "codex",
+};
+
+fs.mkdirSync(path.dirname(dst), { recursive: true });
+const tmp = dst + ".tmp." + process.pid + "." + Date.now();
+fs.writeFileSync(tmp, JSON.stringify(out, null, 2) + "\\n", "utf8");
+fs.renameSync(tmp, dst);
+try {
+  fs.chmodSync(dst, 0o600);
+} catch {
+  // no-op on platforms that don't support POSIX file modes.
+}
 `;
 }
 
@@ -344,8 +353,7 @@ function buildPlistSync({ labelSync, syncScriptPath, homeDir, tokenSyncLog }) {
   <key>Label</key><string>${labelSync}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
-    <string>-lc</string>
+    <string>${process.execPath}</string>
     <string>${syncScriptPath}</string>
   </array>
   <key>RunAtLoad</key><true/>
@@ -356,6 +364,47 @@ function buildPlistSync({ labelSync, syncScriptPath, homeDir, tokenSyncLog }) {
   <key>StandardOutPath</key><string>${tokenSyncLog}</string>
   <key>StandardErrorPath</key><string>${tokenSyncLog}</string>
 </dict></plist>
+`;
+}
+
+function buildLinuxTokenSyncService({ labelSync, syncScriptPath }) {
+  return `[Unit]
+Description=${labelSync}
+
+[Service]
+Type=oneshot
+ExecStart=${process.execPath} ${syncScriptPath}
+`;
+}
+
+function buildLinuxTokenSyncPath({ labelSync, homeDir }) {
+  const authJsonPath = path.join(homeDir, ".codex", "auth.json");
+  return `[Unit]
+Description=${labelSync} watcher
+
+[Path]
+PathChanged=${authJsonPath}
+Unit=${labelSync}.service
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+function buildLinuxProxyService({ labelProxy, proxyBin, configFile, homeDir, proxyLog }) {
+  return `[Unit]
+Description=${labelProxy}
+
+[Service]
+WorkingDirectory=${homeDir}
+ExecStart=${proxyBin} --config ${configFile}
+Restart=always
+RestartSec=2
+StandardOutput=append:${proxyLog}
+StandardError=append:${proxyLog}
+
+[Install]
+WantedBy=default.target
 `;
 }
 
@@ -390,22 +439,42 @@ async function installCliProxyApiBinary({ proxyBin }) {
 
   ensureDir(path.dirname(proxyBin));
 
+  const platform = currentPlatform();
+  const platformToken = platform === "darwin"
+    ? "darwin"
+    : platform === "linux"
+      ? "linux"
+      : platform === "win32"
+        ? "windows"
+        : null;
+  if (!platformToken) fail(`unsupported platform for binary install: ${platform}`);
+
   log("Downloading CLIProxyAPI release from GitHub...");
   const rel = await fetchJson("https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest");
-  const suffix = `darwin_${arch}.tar.gz`;
-  const asset = (rel.assets || []).find((a) => typeof a?.name === "string" && a.name.includes(suffix));
+  const contains = `${platformToken}_${arch}`;
+  const asset = (rel.assets || []).find((a) => typeof a?.name === "string" && a.name.toLowerCase().includes(contains));
   if (!asset?.browser_download_url) {
-    fail(`could not find asset containing: ${suffix}`);
+    fail(`could not find asset containing: ${contains} (platform=${platform}, arch=${process.arch})`);
   }
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-claudecode-proxy-"));
-  const tarball = path.join(tmpDir, "cli-proxy-api.tar.gz");
-  await downloadToFile(asset.browser_download_url, tarball);
+  const downloaded = path.join(tmpDir, asset.name);
+  await downloadToFile(asset.browser_download_url, downloaded);
 
-  log("Extracting tarball...");
-  run("tar", ["-xzf", tarball, "-C", tmpDir]);
-
-  const found = findFileRecursive(tmpDir, ["cli-proxy-api", "CLIProxyAPI"]);
+  let found = null;
+  if (downloaded.endsWith(".tar.gz")) {
+    log("Extracting tarball...");
+    run("tar", ["-xzf", downloaded, "-C", tmpDir]);
+    found = findFileRecursive(tmpDir, ["cli-proxy-api", "CLIProxyAPI", "cli-proxy-api.exe", "CLIProxyAPI.exe"]);
+  } else if (downloaded.endsWith(".zip")) {
+    if (currentPlatform() !== "win32") {
+      fail(`zip asset unsupported on this platform: ${downloaded}`);
+    }
+    run("powershell", ["-NoProfile", "-Command", `Expand-Archive -LiteralPath '${downloaded}' -DestinationPath '${tmpDir}' -Force`]);
+    found = findFileRecursive(tmpDir, ["cli-proxy-api.exe", "CLIProxyAPI.exe", "cli-proxy-api", "CLIProxyAPI"]);
+  } else {
+    found = downloaded;
+  }
   if (!found) fail("failed to locate extracted binary");
 
   fs.copyFileSync(found, proxyBin);
@@ -513,19 +582,19 @@ async function waitForHealthy(port, msTotal = 8000) {
 }
 
 async function installFlow(opts) {
-  if (process.platform !== "darwin") {
-    fail("macOS only (LaunchAgents-based install).");
-  }
+  const platform = currentPlatform();
+  if (!["darwin", "linux", "win32"].includes(platform)) fail(`unsupported platform: ${platform}`);
 
   const homeDir = os.homedir();
   const username = getUsername();
-  const uid = getUid();
 
   const proxyDir = path.join(homeDir, ".cli-proxy-api");
   const authDir = path.join(proxyDir, "auths");
   const configFile = path.join(proxyDir, "config.yaml");
-  const syncScriptPath = path.join(proxyDir, "sync-codex-token.sh");
-  const proxyBin = path.join(homeDir, ".local", "bin", "cli-proxy-api");
+  const syncScriptPath = path.join(proxyDir, "sync-codex-token.mjs");
+  const proxyBin = platform === "win32"
+    ? path.join(homeDir, "AppData", "Local", "codex-claudecode-proxy", "cli-proxy-api.exe")
+    : path.join(homeDir, ".local", "bin", "cli-proxy-api");
   const proxyLog = path.join(proxyDir, "cli-proxy-api.log");
   const tokenSyncLog = path.join(proxyDir, "token-sync.log");
   const claudeSettingsPath = path.join(homeDir, ".claude", "settings.json");
@@ -537,6 +606,10 @@ async function installFlow(opts) {
   const labelSync = `com.${username}.cli-proxy-api-token-sync`;
   const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${labelProxy}.plist`);
   const plistSync = path.join(homeDir, "Library", "LaunchAgents", `${labelSync}.plist`);
+  const linuxSystemdDir = path.join(homeDir, ".config", "systemd", "user");
+  const linuxProxySvc = path.join(linuxSystemdDir, `${labelProxy}.service`);
+  const linuxSyncSvc = path.join(linuxSystemdDir, `${labelSync}.service`);
+  const linuxSyncPath = path.join(linuxSystemdDir, `${labelSync}.path`);
 
   const codexAuth = path.join(homeDir, ".codex", "auth.json");
   if (!exists(codexAuth)) {
@@ -546,7 +619,8 @@ async function installFlow(opts) {
   ensureDir(proxyDir);
   ensureDir(authDir);
   ensureDir(path.dirname(proxyBin));
-  ensureDir(path.dirname(plistProxy));
+  if (platform === "darwin") ensureDir(path.dirname(plistProxy));
+  if (platform === "linux") ensureDir(linuxSystemdDir);
 
   await installCliProxyApiBinary({ proxyBin });
 
@@ -555,29 +629,52 @@ async function installFlow(opts) {
   writeFileAtomic(syncScriptPath, tokenSyncScript(), 0o755);
 
   log("Syncing token once...");
-  run("/bin/bash", ["-lc", syncScriptPath]);
+  run(process.execPath, [syncScriptPath]);
 
-  log("Writing LaunchAgents...");
-  writeFileAtomic(plistSync, buildPlistSync({ labelSync, syncScriptPath, homeDir, tokenSyncLog }), 0o644);
-  writeFileAtomic(plistProxy, buildPlistProxy({ labelProxy, proxyBin, configFile, homeDir, proxyLog }), 0o644);
+  if (platform === "darwin") {
+    const uid = getUid();
+    log("Writing LaunchAgents...");
+    writeFileAtomic(plistSync, buildPlistSync({ labelSync, syncScriptPath, homeDir, tokenSyncLog }), 0o644);
+    writeFileAtomic(plistProxy, buildPlistProxy({ labelProxy, proxyBin, configFile, homeDir, proxyLog }), 0o644);
 
-  log("Reloading LaunchAgents...");
-  launchctlBootout(uid, labelProxy);
-  launchctlBootout(uid, labelSync);
-  launchctlBootstrap(uid, plistSync);
-  launchctlBootstrap(uid, plistProxy);
-  launchctlKickstart(uid, labelSync);
-  launchctlKickstart(uid, labelProxy);
+    log("Reloading LaunchAgents...");
+    launchctlBootout(uid, labelProxy);
+    launchctlBootout(uid, labelSync);
+    launchctlBootstrap(uid, plistSync);
+    launchctlBootstrap(uid, plistProxy);
+    launchctlKickstart(uid, labelSync);
+    launchctlKickstart(uid, labelProxy);
+  } else if (platform === "linux") {
+    log("Writing systemd user units...");
+    writeFileAtomic(linuxSyncSvc, buildLinuxTokenSyncService({ labelSync, syncScriptPath }), 0o644);
+    writeFileAtomic(linuxSyncPath, buildLinuxTokenSyncPath({ labelSync, homeDir }), 0o644);
+    writeFileAtomic(linuxProxySvc, buildLinuxProxyService({ labelProxy, proxyBin, configFile, homeDir, proxyLog }), 0o644);
+    run("systemctl", ["--user", "daemon-reload"]);
+    run("systemctl", ["--user", "enable", "--now", `${labelSync}.path`]);
+    run("systemctl", ["--user", "start", `${labelSync}.service`], { allowFail: true });
+    run("systemctl", ["--user", "enable", "--now", `${labelProxy}.service`]);
+  } else if (platform === "win32") {
+    const syncTask = `${labelSync}`;
+    const proxyTask = `${labelProxy}`;
+    run("schtasks", ["/create", "/tn", syncTask, "/sc", "MINUTE", "/mo", "5", "/f", "/tr", `\"${process.execPath}\" \"${syncScriptPath}\"`]);
+    run("schtasks", ["/run", "/tn", syncTask], { allowFail: true });
+    run("schtasks", ["/create", "/tn", proxyTask, "/sc", "ONLOGON", "/f", "/tr", `\"${proxyBin}\" --config \"${configFile}\"`]);
+    run("schtasks", ["/run", "/tn", proxyTask], { allowFail: true });
+  }
 
-  const healthy = await waitForHealthy(port, 10000);
-  if (!healthy) fail(`proxy did not become healthy (check ${proxyLog})`);
+  if (!shouldSkipHealthcheck()) {
+    const healthy = await waitForHealthy(port, 10000);
+    if (!healthy) fail(`proxy did not become healthy (check ${proxyLog})`);
+  }
 
   log("Updating Claude Code settings...");
   updateClaudeSettings({ claudeSettingsPath, port, model });
 
-  log("Verifying reasoning.effort=xhigh ...");
-  const ok = await verifyReasoningEffort(port, model);
-  if (!ok) fail("expected reasoning.effort=xhigh but verification failed");
+  if (!shouldSkipHealthcheck()) {
+    log("Verifying reasoning.effort=xhigh ...");
+    const ok = await verifyReasoningEffort(port, model);
+    if (!ok) fail("expected reasoning.effort=xhigh but verification failed");
+  }
 
   log("");
   log("All done.");
@@ -588,10 +685,10 @@ async function installFlow(opts) {
 }
 
 async function startFlow(opts) {
-  if (process.platform !== "darwin") fail("macOS only.");
+  const platform = currentPlatform();
+  if (!["darwin", "linux", "win32"].includes(platform)) fail(`unsupported platform: ${platform}`);
   const homeDir = os.homedir();
   const username = getUsername();
-  const uid = getUid();
   const configFile = path.join(homeDir, ".cli-proxy-api", "config.yaml");
   const port = readPortFromProxyConfig(configFile) ?? DEFAULT_PORT;
   const labelProxy = `com.${username}.cli-proxy-api`;
@@ -599,28 +696,50 @@ async function startFlow(opts) {
   const labelSync = `com.${username}.cli-proxy-api-token-sync`;
   const plistSync = path.join(homeDir, "Library", "LaunchAgents", `${labelSync}.plist`);
 
-  if (exists(plistSync)) {
-    launchctlBootstrap(uid, plistSync);
-    launchctlKickstart(uid, labelSync);
+  if (platform === "darwin") {
+    const uid = getUid();
+    if (exists(plistSync)) {
+      launchctlBootstrap(uid, plistSync);
+      launchctlKickstart(uid, labelSync);
+    }
+    if (!exists(plistProxy)) fail(`missing plist: ${plistProxy} (run install first)`);
+    launchctlBootstrap(uid, plistProxy);
+    launchctlKickstart(uid, labelProxy);
+  } else if (platform === "linux") {
+    run("systemctl", ["--user", "start", `${labelSync}.service`], { allowFail: true });
+    run("systemctl", ["--user", "enable", "--now", `${labelSync}.path`], { allowFail: true });
+    run("systemctl", ["--user", "enable", "--now", `${labelProxy}.service`]);
+  } else {
+    run("schtasks", ["/run", "/tn", `${labelSync}`], { allowFail: true });
+    run("schtasks", ["/run", "/tn", `${labelProxy}`]);
   }
-  if (!exists(plistProxy)) fail(`missing plist: ${plistProxy} (run install first)`);
-  launchctlBootstrap(uid, plistProxy);
-  launchctlKickstart(uid, labelProxy);
 
-  const healthy = await waitForHealthy(port, 10000);
-  if (!healthy) fail("proxy did not become healthy");
+  if (!shouldSkipHealthcheck()) {
+    const healthy = await waitForHealthy(port, 10000);
+    if (!healthy) fail("proxy did not become healthy");
+  }
   log("proxy started");
 }
 
 async function stopFlow() {
-  if (process.platform !== "darwin") fail("macOS only.");
+  const platform = currentPlatform();
+  if (!["darwin", "linux", "win32"].includes(platform)) fail(`unsupported platform: ${platform}`);
   const username = getUsername();
-  const uid = getUid();
   const labelProxy = `com.${username}.cli-proxy-api`;
   const labelSync = `com.${username}.cli-proxy-api-token-sync`;
-  launchctlBootout(uid, labelProxy);
-  launchctlBootout(uid, labelSync);
-  log("proxy stopped (launchagents unloaded)");
+  if (platform === "darwin") {
+    const uid = getUid();
+    launchctlBootout(uid, labelProxy);
+    launchctlBootout(uid, labelSync);
+    log("proxy stopped (launchagents unloaded)");
+  } else if (platform === "linux") {
+    run("systemctl", ["--user", "stop", `${labelProxy}.service`], { allowFail: true });
+    run("systemctl", ["--user", "stop", `${labelSync}.path`], { allowFail: true });
+    log("proxy stopped (systemd user units stopped)");
+  } else {
+    run("schtasks", ["/end", "/tn", `${labelProxy}`], { allowFail: true });
+    log("proxy stop requested (windows scheduled task ended)");
+  }
 }
 
 async function statusFlow(opts) {
@@ -629,34 +748,62 @@ async function statusFlow(opts) {
   const port = readPortFromProxyConfig(configFile) ?? DEFAULT_PORT;
   const portOk = await proxyHealthcheck(port);
   log(`healthcheck: ${portOk ? "OK" : "NOT RUNNING"} (http://127.0.0.1:${port}/v1/models)`);
-  if (process.platform === "darwin") {
+  const platform = currentPlatform();
+  if (platform === "darwin") {
     const username = getUsername();
     const uid = getUid();
     const labelProxy = `com.${username}.cli-proxy-api`;
     const labelSync = `com.${username}.cli-proxy-api-token-sync`;
     log(`launchctl proxy job: ${launchctlPrint(uid, labelProxy) ? "loaded" : "not loaded"}`);
     log(`launchctl token-sync job: ${launchctlPrint(uid, labelSync) ? "loaded" : "not loaded"}`);
+  } else if (platform === "linux") {
+    const rProxy = run("systemctl", ["--user", "is-active", `${getUsername()}.cli-proxy-api.service`], { allowFail: true });
+    const rSync = run("systemctl", ["--user", "is-active", `${getUsername()}.cli-proxy-api-token-sync.path`], { allowFail: true });
+    log(`systemd proxy service: ${rProxy.status === 0 ? "active" : "inactive"}`);
+    log(`systemd token-sync path: ${rSync.status === 0 ? "active" : "inactive"}`);
+  } else if (platform === "win32") {
+    const user = getUsername();
+    log(`windows scheduled tasks: ${`com.${user}.cli-proxy-api`} / ${`com.${user}.cli-proxy-api-token-sync`}`);
   }
 }
 
 async function uninstallFlow(opts) {
-  if (process.platform !== "darwin") fail("macOS only.");
+  const platform = currentPlatform();
+  if (!["darwin", "linux", "win32"].includes(platform)) fail(`unsupported platform: ${platform}`);
   const homeDir = os.homedir();
   const username = getUsername();
-  const uid = getUid();
   const labelProxy = `com.${username}.cli-proxy-api`;
   const labelSync = `com.${username}.cli-proxy-api-token-sync`;
   const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${labelProxy}.plist`);
   const plistSync = path.join(homeDir, "Library", "LaunchAgents", `${labelSync}.plist`);
+  const linuxSystemdDir = path.join(homeDir, ".config", "systemd", "user");
+  const linuxProxySvc = path.join(linuxSystemdDir, `${labelProxy}.service`);
+  const linuxSyncSvc = path.join(linuxSystemdDir, `${labelSync}.service`);
+  const linuxSyncPath = path.join(linuxSystemdDir, `${labelSync}.path`);
   const claudeSettingsPath = path.join(homeDir, ".claude", "settings.json");
   const proxyDir = path.join(homeDir, ".cli-proxy-api");
-  const proxyBin = path.join(homeDir, ".local", "bin", "cli-proxy-api");
+  const proxyBin = platform === "win32"
+    ? path.join(homeDir, "AppData", "Local", "codex-claudecode-proxy", "cli-proxy-api.exe")
+    : path.join(homeDir, ".local", "bin", "cli-proxy-api");
 
-  launchctlBootout(uid, labelProxy);
-  launchctlBootout(uid, labelSync);
+  if (platform === "darwin") {
+    const uid = getUid();
+    launchctlBootout(uid, labelProxy);
+    launchctlBootout(uid, labelSync);
 
-  if (exists(plistProxy)) fs.rmSync(plistProxy, { force: true });
-  if (exists(plistSync)) fs.rmSync(plistSync, { force: true });
+    if (exists(plistProxy)) fs.rmSync(plistProxy, { force: true });
+    if (exists(plistSync)) fs.rmSync(plistSync, { force: true });
+  } else if (platform === "linux") {
+    run("systemctl", ["--user", "disable", "--now", `${labelProxy}.service`], { allowFail: true });
+    run("systemctl", ["--user", "disable", "--now", `${labelSync}.path`], { allowFail: true });
+    run("systemctl", ["--user", "daemon-reload"], { allowFail: true });
+    if (exists(linuxProxySvc)) fs.rmSync(linuxProxySvc, { force: true });
+    if (exists(linuxSyncSvc)) fs.rmSync(linuxSyncSvc, { force: true });
+    if (exists(linuxSyncPath)) fs.rmSync(linuxSyncPath, { force: true });
+  } else {
+    run("schtasks", ["/delete", "/tn", `${labelProxy}`, "/f"], { allowFail: true });
+    run("schtasks", ["/delete", "/tn", `${labelSync}`, "/f"], { allowFail: true });
+  }
 
   // Always restore Claude Code settings so "claude" doesn't keep pointing at a removed proxy.
   cleanupClaudeSettings({ claudeSettingsPath, model: DEFAULT_MODEL });

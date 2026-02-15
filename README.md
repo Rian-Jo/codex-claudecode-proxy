@@ -14,7 +14,7 @@ npx -y codex-claudecode-proxy
 
 ## Requirements
 
-- macOS only (for now)
+- macOS (launchd), Ubuntu/Linux (systemd --user), and Windows (Task Scheduler)
 - Claude Code is installed
 - You are logged in to Codex CLI
 
