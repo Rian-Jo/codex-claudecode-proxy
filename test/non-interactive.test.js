@@ -68,6 +68,30 @@ exit 0
   );
 }
 
+function writeStubSystemctl(stubBinDir) {
+  const p = path.join(stubBinDir, "systemctl");
+  writeFile(
+    p,
+    `#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+`,
+    0o755,
+  );
+}
+
+function writeStubSchtasks(stubBinDir) {
+  const p = path.join(stubBinDir, "schtasks");
+  writeFile(
+    p,
+    `#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+`,
+    0o755,
+  );
+}
+
 function makeCodexAuthJson() {
   // plutil -extract works with JSON on macOS, so keep this shape.
   return JSON.stringify(
@@ -119,6 +143,7 @@ test("install succeeds without --yes (non-interactive only)", async (t) => {
           HOME: home,
           USER: "testuser",
           PATH: `${stubBin}:${process.env.PATH || ""}`,
+          CODEX_PROXY_PLATFORM: "darwin",
         },
         stdio: ["ignore", "pipe", "pipe"],
       },
@@ -156,6 +181,58 @@ test("install succeeds without --yes (non-interactive only)", async (t) => {
   assert.match(cfg, new RegExp(`^port:\\s*${port}\\s*$`, "m"), "expected config.yaml to keep selected port");
 });
 
+test("install succeeds on linux mode with systemd stubs", async (t) => {
+  const home = mkTmpDir("codex-claudecode-proxy-home-linux-");
+  const stubBin = path.join(home, "stub-bin");
+  fs.mkdirSync(stubBin, { recursive: true });
+  writeStubSystemctl(stubBin);
+
+  writeFile(path.join(home, ".codex", "auth.json"), makeCodexAuthJson(), 0o600);
+  const proxyBin = path.join(home, ".local", "bin", "cli-proxy-api");
+  writeFile(proxyBin, "#!/usr/bin/env bash\nexit 0\n", 0o755);
+
+  const { server, port } = await startFakeProxyServer();
+  t.after(() => server.close());
+  writeFile(path.join(home, ".cli-proxy-api", "config.yaml"), `port: ${port}\n`, 0o644);
+
+  const cli = path.resolve(process.cwd(), "bin", "codex-claudecode-proxy.js");
+  const r = spawnSync(process.execPath, [cli, "install"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: home,
+      USER: "testuser",
+      PATH: `${stubBin}:${process.env.PATH || ""}`,
+      CODEX_PROXY_PLATFORM: "linux",
+      CODEX_PROXY_SKIP_HEALTHCHECK: "1",
+    },
+  });
+
+  assert.equal(r.status, 0, `expected exit 0\nstdout:\n${r.stdout || ""}\nstderr:\n${r.stderr || ""}`);
+  assert.equal(fs.existsSync(path.join(home, ".config", "systemd", "user", "com.testuser.cli-proxy-api.service")), true);
+});
+
+test("uninstall succeeds in windows mode with schtasks stubs", () => {
+  const home = mkTmpDir("codex-claudecode-proxy-home-win-");
+  const stubBin = path.join(home, "stub-bin");
+  fs.mkdirSync(stubBin, { recursive: true });
+  writeStubSchtasks(stubBin);
+
+  const cli = path.resolve(process.cwd(), "bin", "codex-claudecode-proxy.js");
+  const r = spawnSync(process.execPath, [cli, "uninstall"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: home,
+      USER: "testuser",
+      PATH: `${stubBin}:${process.env.PATH || ""}`,
+      CODEX_PROXY_PLATFORM: "win32",
+    },
+  });
+
+  assert.equal(r.status, 0, `expected exit 0\nstdout:\n${r.stdout || ""}\nstderr:\n${r.stderr || ""}`);
+});
+
 test("uninstall succeeds without --yes (non-interactive only)", () => {
   const home = mkTmpDir("codex-claudecode-proxy-home-");
   const stubBin = path.join(home, "stub-bin");
@@ -170,6 +247,7 @@ test("uninstall succeeds without --yes (non-interactive only)", () => {
       HOME: home,
       USER: "testuser",
       PATH: `${stubBin}:${process.env.PATH || ""}`,
+      CODEX_PROXY_PLATFORM: "darwin",
     },
   });
 
